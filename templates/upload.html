@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>{{ step.label }} &middot; BC Debt Collection</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        background: #f3f5f8;
+        margin: 0;
+        padding: 0;
+      }
+      header {
+        background: #1f3c88;
+        color: #fff;
+        padding: 1.2rem;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+      header a {
+        color: #fff;
+        text-decoration: none;
+        font-size: 0.9rem;
+      }
+      main {
+        max-width: 700px;
+        margin: 2rem auto;
+        padding: 0 1rem;
+      }
+      .card {
+        background: #fff;
+        border-radius: 8px;
+        padding: 2rem;
+        box-shadow: 0 6px 16px rgba(0, 0, 0, 0.08);
+      }
+      h1 {
+        margin-top: 0;
+        color: #1f3c88;
+      }
+      p {
+        color: #444;
+      }
+      .error {
+        background: #ffe1e1;
+        color: #a30000;
+        padding: 0.8rem 1rem;
+        border-radius: 6px;
+        margin-bottom: 1rem;
+      }
+      form {
+        margin-top: 1rem;
+      }
+      input[type="file"] {
+        display: none;
+      }
+      button {
+        margin-top: 1.5rem;
+        background: #1f3c88;
+        color: #fff;
+        border: none;
+        padding: 0.8rem 1.6rem;
+        border-radius: 4px;
+        cursor: pointer;
+      }
+      button:hover {
+        background: #162d66;
+      }
+      .dropzones {
+        display: grid;
+        gap: 1.2rem;
+        margin-top: 1rem;
+      }
+      .drop-wrapper {
+        background: #f9fbfe;
+        border-radius: 10px;
+        padding: 1.4rem;
+        border: 1px solid #d4e0fa;
+      }
+      .drop-wrapper h2 {
+        margin: 0 0 0.5rem;
+        color: #1f3c88;
+        font-size: 1.05rem;
+      }
+      .dropzone {
+        border: 2px dashed #1f3c88;
+        border-radius: 8px;
+        padding: 1.8rem;
+        background: #f7f9ff;
+        text-align: center;
+        color: #1f3c88;
+        transition: border-color 0.2s ease, background 0.2s ease;
+      }
+      .dropzone.dragover {
+        border-color: #162d66;
+        background: #e9f0ff;
+      }
+      .dropzone strong {
+        display: block;
+        font-size: 1.05rem;
+        margin-bottom: 0.3rem;
+      }
+      .dropzone span {
+        display: block;
+        font-size: 0.9rem;
+        color: #445;
+      }
+      .file-list {
+        margin-top: 0.8rem;
+        background: #fff;
+        border-radius: 6px;
+        border: 1px solid #c8d4f0;
+        padding: 0.6rem 0.9rem;
+        color: #333;
+        font-size: 0.92rem;
+      }
+      .file-list ul {
+        margin: 0.3rem 0 0;
+        padding-left: 1.2rem;
+      }
+      .file-list li {
+        margin: 0.2rem 0;
+      }
+      .hint {
+        font-size: 0.82rem;
+        color: #667;
+        margin-top: 0.4rem;
+      }
+      .error-text {
+        color: #a30000;
+        font-size: 0.82rem;
+        margin-top: 0.4rem;
+      }
+      @media (min-width: 640px) {
+        .dropzones {
+          grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div>{{ step.label }}</div>
+      <a href="{{ url_for('index') }}">&laquo; All workflows</a>
+    </header>
+    <main>
+      <div class="card">
+        {% if error %}
+        <div class="error">{{ error }}</div>
+        {% endif %}
+        <h1>{{ step.label }}</h1>
+        <p>{{ step.description }}</p>
+        <p><strong>Upload guidance:</strong> {{ step.file_hint }}</p>
+        <p>
+          <em>Files required: {{ step.expected_files }} |
+            Accepted types: {{ step.allowed_extensions|join(', ') }}</em>
+        </p>
+        <form id="upload-form" action="{{ url_for('process_step', step_key=step_key) }}" method="post" enctype="multipart/form-data">
+          <div class="dropzones">
+            {% for zone in step.dropzones %}
+            <div class="drop-wrapper">
+              <h2>{{ zone.label }}</h2>
+              <div
+                class="dropzone"
+                data-zone="{{ zone.id }}"
+                data-max="{{ zone.max }}"
+                data-accept="{{ zone.accept|join(',') }}"
+              >
+                <strong>Drag &amp; drop here</strong>
+                <span>or click to browse</span>
+                <div class="hint">{{ zone.hint }}</div>
+              </div>
+              <input
+                id="file-input-{{ zone.id }}"
+                type="file"
+                name="files"
+                accept="{{ zone.accept|join(',') }}"
+                {% if zone.max > 1 %}multiple{% endif %}
+                data-zone="{{ zone.id }}"
+              />
+              <div id="error-{{ zone.id }}" class="error-text" style="display:none;"></div>
+              <div id="file-list-{{ zone.id }}" class="file-list" style="display:none;">
+                <strong>Selected file{{ '' if zone.max == 1 else 's' }}:</strong>
+                <ul></ul>
+              </div>
+            </div>
+            {% endfor %}
+          </div>
+          <button type="submit">Process</button>
+        </form>
+      </div>
+    </main>
+    <script>
+      (function () {
+        const form = document.getElementById('upload-form');
+        const zones = document.querySelectorAll('.dropzone');
+        const zoneStates = {};
+
+        zones.forEach(zone => {
+          const zoneId = zone.dataset.zone;
+          const max = parseInt(zone.dataset.max, 10) || 1;
+          const accepts = (zone.dataset.accept || '').split(',').map(ext => ext.trim().toLowerCase()).filter(Boolean);
+          const input = document.getElementById(`file-input-${zoneId}`);
+          const listContainer = document.getElementById(`file-list-${zoneId}`);
+          const listUl = listContainer.querySelector('ul');
+          const errorBox = document.getElementById(`error-${zoneId}`);
+
+          zoneStates[zoneId] = { max, accepts, input, listContainer, listUl, errorBox };
+
+          function clearError() {
+            errorBox.style.display = 'none';
+            errorBox.textContent = '';
+          }
+
+          function showError(message) {
+            errorBox.style.display = 'block';
+            errorBox.textContent = message;
+          }
+
+          function renderList() {
+            const files = input.files;
+            if (!files || files.length === 0) {
+              listContainer.style.display = 'none';
+              listUl.innerHTML = '';
+              return;
+            }
+            listContainer.style.display = 'block';
+            listUl.innerHTML = '';
+            Array.from(files).forEach(file => {
+              const li = document.createElement('li');
+              li.textContent = `${file.name} (${Math.round(file.size / 1024)} KB)`;
+              listUl.appendChild(li);
+            });
+          }
+
+          function validateAndSet(files) {
+            clearError();
+            if (files.length === 0) {
+              input.value = '';
+              renderList();
+              return;
+            }
+            if (files.length > max) {
+              showError(`Only ${max} file${max === 1 ? '' : 's'} allowed here.`);
+              return;
+            }
+            for (const file of files) {
+              const ext = '.' + file.name.split('.').pop().toLowerCase();
+              if (accepts.length && !accepts.includes(ext)) {
+                showError(`"${file.name}" must be one of: ${accepts.join(', ')}`);
+                return;
+              }
+            }
+            const dataTransfer = new DataTransfer();
+            Array.from(files).forEach(file => dataTransfer.items.add(file));
+            input.files = dataTransfer.files;
+            renderList();
+          }
+
+          zone.addEventListener('click', () => input.click());
+
+          zone.addEventListener('dragover', event => {
+            event.preventDefault();
+            zone.classList.add('dragover');
+          });
+
+          zone.addEventListener('dragleave', () => {
+            zone.classList.remove('dragover');
+          });
+
+          zone.addEventListener('drop', event => {
+            event.preventDefault();
+            zone.classList.remove('dragover');
+            validateAndSet(event.dataTransfer.files);
+          });
+
+          input.addEventListener('change', () => {
+            validateAndSet(input.files);
+          });
+        });
+
+        form.addEventListener('submit', event => {
+          let valid = true;
+          Object.entries(zoneStates).forEach(([zoneId, state]) => {
+            const files = state.input.files;
+            if (files.length !== state.max) {
+              state.errorBox.style.display = 'block';
+              state.errorBox.textContent = `Please provide ${state.max} file${state.max === 1 ? '' : 's'} for this section.`;
+              valid = false;
+            }
+          });
+          if (!valid) {
+            event.preventDefault();
+          }
+        });
+      })();
+    </script>
+  </body>
+</html>

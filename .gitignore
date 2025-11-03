@@ -1,0 +1,20 @@
+# Virtual environments
+.venv/
+env/
+venv/
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Local sessions and generated outputs
+sessions/
+
+# IDE configuration
+.vscode/
+.idea/
+
+# Platform artifacts
+*.log
+*.tmp
+
