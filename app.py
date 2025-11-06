@@ -105,10 +105,10 @@ def process_bc_claims(session_dir: Path, uploads: List[Path]) -> List[Path]:
 
 def process_on_claims(session_dir: Path, uploads: List[Path]) -> List[Path]:
     metadata: Dict[str, str] = {}
-    schedule_template: Optional[Path] = None
-    claim_template: Optional[Path] = None
-    docx_candidates: List[Path] = []
+    schedule_template: Path = ontario_claims.DEFAULT_SCHEDULE_TEMPLATE
+    claim_template: Path = ontario_claims.DEFAULT_CLAIM_TEMPLATE
     pdf_candidates: List[Path] = []
+    docx_overrides: List[Path] = []
 
     for candidate in uploads:
         suffix = candidate.suffix.lower()
@@ -117,33 +117,18 @@ def process_on_claims(session_dir: Path, uploads: List[Path]) -> List[Path]:
             for key, value in raw_data.items():
                 metadata[str(key)] = str(value)
         elif suffix == ".docx":
-            docx_candidates.append(candidate)
+            docx_overrides.append(candidate)
         elif suffix == ".pdf":
             pdf_candidates.append(candidate)
 
-    for docx_path in docx_candidates:
+    for docx_path in docx_overrides:
         identified = ontario_claims.identify_template(docx_path)
         upper_name = docx_path.name.upper()
-        if identified == "SCHEDULE" or ("SCHEDULE" in upper_name and schedule_template is None):
-            if schedule_template is None:
-                schedule_template = docx_path
+        if identified == "SCHEDULE" or ("SCHEDULE" in upper_name and schedule_template == ontario_claims.DEFAULT_SCHEDULE_TEMPLATE):
+            schedule_template = docx_path
             continue
-        if identified == "CLAIM" or (
-            ("CLAIM" in upper_name or "7A" in upper_name) and claim_template is None
-        ):
-            if claim_template is None:
-                claim_template = docx_path
-            continue
-    if schedule_template is None and docx_candidates:
-        schedule_template = docx_candidates[0]
-    if claim_template is None and len(docx_candidates) > 1:
-        for candidate in docx_candidates:
-            if candidate is not schedule_template:
-                claim_template = candidate
-                break
-
-    if schedule_template is None or claim_template is None:
-        raise ValueError("Upload both Schedule A and ON Form 7A templates (DOCX).")
+        if identified == "CLAIM" or ("CLAIM" in upper_name or "7A" in upper_name):
+            claim_template = docx_path
 
     files_by_type: Dict[str, Path] = {}
     leftovers: List[Path] = []
@@ -222,9 +207,11 @@ STEPS: Dict[str, StepConfig] = {
     "on_claims": StepConfig(
         label="ON Claims",
         description="Generate Ontario Schedule A and Plaintiff's Claim from four statements.",
-        file_hint="Upload the four PDFs (MRP, MRC, MRS, Credit Report) and the two Ontario templates.",
-        expected_files=6,
-        allowed_extensions=[".pdf", ".docx"],
+        file_hint="Upload the four PDFs (MRP, MRC, MRS, Credit Report). Templates can be overridden if desired.",
+        expected_files=4,
+        allowed_extensions=[".pdf"],
+        optional_extensions=[".docx", ".json"],
+        optional_max=3,
         processor=process_on_claims,
         dropzones=[
             {
@@ -233,6 +220,7 @@ STEPS: Dict[str, StepConfig] = {
                 "hint": "Upload the Ontario MRP statement.",
                 "accept": [".pdf"],
                 "max": 1,
+                "required": True,
             },
             {
                 "id": "on-mrc",
@@ -240,6 +228,7 @@ STEPS: Dict[str, StepConfig] = {
                 "hint": "Upload the Ontario MRC statement.",
                 "accept": [".pdf"],
                 "max": 1,
+                "required": True,
             },
             {
                 "id": "on-mrs",
@@ -247,6 +236,7 @@ STEPS: Dict[str, StepConfig] = {
                 "hint": "Upload the Ontario MRS statement.",
                 "accept": [".pdf"],
                 "max": 1,
+                "required": True,
             },
             {
                 "id": "on-cbr",
@@ -254,20 +244,31 @@ STEPS: Dict[str, StepConfig] = {
                 "hint": "Upload the TransUnion credit report.",
                 "accept": [".pdf"],
                 "max": 1,
+                "required": True,
             },
             {
                 "id": "on-schedule",
-                "label": "Ontario Schedule A Template",
-                "hint": "Upload the ON Schedule A DOCX template.",
+                "label": "Schedule A Template Override (optional)",
+                "hint": "Upload a custom Schedule A DOCX to override the default template.",
                 "accept": [".docx"],
                 "max": 1,
+                "required": False,
             },
             {
-                "id": "on-claim",
-                "label": "Ontario Form 7A Template",
-                "hint": "Upload the ON Plaintiff's Claim (Form 7A) DOCX template.",
+                "id": "on-claim-template",
+                "label": "Form 7A Template Override (optional)",
+                "hint": "Upload a custom Plaintiff's Claim (Form 7A) DOCX if desired.",
                 "accept": [".docx"],
                 "max": 1,
+                "required": False,
+            },
+            {
+                "id": "on-metadata",
+                "label": "Case Metadata (optional)",
+                "hint": "Optional JSON with keys like demand_letter_date and claim_prepared_date.",
+                "accept": [".json"],
+                "max": 1,
+                "required": False,
             },
         ],
     ),

@@ -59,6 +59,11 @@ CLAIM_PLACEHOLDERS = (
     "YEARENDINSERT",
 )
 
+MODULE_DIR = Path(__file__).resolve().parent
+ASSET_DIR = MODULE_DIR.parent / "assets" / "ontario"
+DEFAULT_SCHEDULE_TEMPLATE = ASSET_DIR / "Schedule A - AMEX ON.docx"
+DEFAULT_CLAIM_TEMPLATE = ASSET_DIR / "Plaintiffs Claim Form 7A.docx"
+
 
 class OntarioClaimsError(RuntimeError):
     """Raised when the Ontario claims workflow cannot complete."""
@@ -546,11 +551,15 @@ def generate_claim_documents(
     mrc_path: Path,
     mrp_path: Path,
     cbr_path: Path,
-    schedule_template: Path,
-    claim_template: Path,
+    schedule_template: Path = DEFAULT_SCHEDULE_TEMPLATE,
+    claim_template: Path = DEFAULT_CLAIM_TEMPLATE,
     demand_letter_date: Optional[str] = None,
     claim_prepared_date: Optional[str] = None,
 ) -> Dict[str, Tuple[str, bytes]]:
+    if not schedule_template.exists():
+        raise OntarioClaimsError(f"Schedule template not found at {schedule_template}")
+    if not claim_template.exists():
+        raise OntarioClaimsError(f"Claim template not found at {claim_template}")
     mrs_data = parse_mrs_statement(mrs_path)
     last_charge = parse_last_purchase_date(mrc_path)
     last_payment = parse_last_payment_date(mrp_path)

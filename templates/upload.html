@@ -160,12 +160,13 @@
             {% for zone in step.dropzones %}
             <div class="drop-wrapper">
               <h2>{{ zone.label }}</h2>
-              <div
-                class="dropzone"
-                data-zone="{{ zone.id }}"
-                data-max="{{ zone.max }}"
-                data-accept="{{ zone.accept|join(',') }}"
-              >
+            <div
+              class="dropzone"
+              data-zone="{{ zone.id }}"
+              data-max="{{ zone.max }}"
+              data-accept="{{ zone.accept|join(',') }}"
+              data-required="{{ 'true' if zone.required|default(True) else 'false' }}"
+            >
                 <strong>Drag &amp; drop here</strong>
                 <span>or click to browse</span>
                 <div class="hint">{{ zone.hint }}</div>
@@ -200,12 +201,13 @@
           const zoneId = zone.dataset.zone;
           const max = parseInt(zone.dataset.max, 10) || 1;
           const accepts = (zone.dataset.accept || '').split(',').map(ext => ext.trim().toLowerCase()).filter(Boolean);
+          const required = zone.dataset.required !== 'false';
           const input = document.getElementById(`file-input-${zoneId}`);
           const listContainer = document.getElementById(`file-list-${zoneId}`);
           const listUl = listContainer.querySelector('ul');
           const errorBox = document.getElementById(`error-${zoneId}`);
 
-          zoneStates[zoneId] = { max, accepts, input, listContainer, listUl, errorBox };
+          zoneStates[zoneId] = { max, accepts, input, listContainer, listUl, errorBox, required };
 
           function clearError() {
             errorBox.style.display = 'none';
@@ -283,9 +285,15 @@
           let valid = true;
           Object.entries(zoneStates).forEach(([zoneId, state]) => {
             const files = state.input.files;
-            if (files.length !== state.max) {
+            if (state.required) {
+              if (files.length !== state.max) {
+                state.errorBox.style.display = 'block';
+                state.errorBox.textContent = `Please provide ${state.max} file${state.max === 1 ? '' : 's'} for this section.`;
+                valid = false;
+              }
+            } else if (files.length > state.max) {
               state.errorBox.style.display = 'block';
-              state.errorBox.textContent = `Please provide ${state.max} file${state.max === 1 ? '' : 's'} for this section.`;
+              state.errorBox.textContent = `You can upload at most ${state.max} optional file${state.max === 1 ? '' : 's'} here.`;
               valid = false;
             }
           });
