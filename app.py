@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
-"""Minimal web UI to run BC debt collection automation scripts."""
+"""Minimal web UI to run debt collection automation scripts."""
 
 from __future__ import annotations
 
 import uuid
+import json
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List
+from typing import Callable, Dict, List, Optional
 
 from flask import (
     Flask,
@@ -17,7 +19,13 @@ from flask import (
     url_for,
 )
 
-from workflows import bc_claims, default_judgment, demand_letter, dismissal
+from workflows import (
+    bc_claims,
+    default_judgment,
+    demand_letter,
+    dismissal,
+    ontario_claims,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 SESSIONS_DIR = BASE_DIR / "sessions"
@@ -33,6 +41,8 @@ class StepConfig:
     allowed_extensions: List[str]
     processor: Callable[[Path, List[Path]], List[Path]]
     dropzones: List[Dict[str, object]] = field(default_factory=list)
+    optional_extensions: List[str] = field(default_factory=list)
+    optional_max: int = 0
 
 
 def process_demand_letter(session_dir: Path, uploads: List[Path]) -> List[Path]:
@@ -93,6 +103,104 @@ def process_bc_claims(session_dir: Path, uploads: List[Path]) -> List[Path]:
     return [schedule_path, notice_path]
 
 
+def process_on_claims(session_dir: Path, uploads: List[Path]) -> List[Path]:
+    metadata: Dict[str, str] = {}
+    schedule_template: Optional[Path] = None
+    claim_template: Optional[Path] = None
+    docx_candidates: List[Path] = []
+    pdf_candidates: List[Path] = []
+
+    for candidate in uploads:
+        suffix = candidate.suffix.lower()
+        if suffix == ".json":
+            raw_data = json.loads(candidate.read_text(encoding="utf-8"))
+            for key, value in raw_data.items():
+                metadata[str(key)] = str(value)
+        elif suffix == ".docx":
+            docx_candidates.append(candidate)
+        elif suffix == ".pdf":
+            pdf_candidates.append(candidate)
+
+    for docx_path in docx_candidates:
+        identified = ontario_claims.identify_template(docx_path)
+        upper_name = docx_path.name.upper()
+        if identified == "SCHEDULE" or ("SCHEDULE" in upper_name and schedule_template is None):
+            if schedule_template is None:
+                schedule_template = docx_path
+            continue
+        if identified == "CLAIM" or (
+            ("CLAIM" in upper_name or "7A" in upper_name) and claim_template is None
+        ):
+            if claim_template is None:
+                claim_template = docx_path
+            continue
+    if schedule_template is None and docx_candidates:
+        schedule_template = docx_candidates[0]
+    if claim_template is None and len(docx_candidates) > 1:
+        for candidate in docx_candidates:
+            if candidate is not schedule_template:
+                claim_template = candidate
+                break
+
+    if schedule_template is None or claim_template is None:
+        raise ValueError("Upload both Schedule A and ON Form 7A templates (DOCX).")
+
+    files_by_type: Dict[str, Path] = {}
+    leftovers: List[Path] = []
+    for pdf_path in pdf_candidates:
+        name = pdf_path.name.upper()
+        if "MRP" in name and "MRP" not in files_by_type:
+            files_by_type["MRP"] = pdf_path
+        elif "MRC" in name and "MRC" not in files_by_type:
+            files_by_type["MRC"] = pdf_path
+        elif "MRS" in name and "MRS" not in files_by_type:
+            files_by_type["MRS"] = pdf_path
+        elif ("CBR" in name or "CREDIT REPORT" in name) and "CBR" not in files_by_type:
+            files_by_type["CBR"] = pdf_path
+        else:
+            leftovers.append(pdf_path)
+
+    for pdf_path in leftovers:
+        text, _ = ontario_claims.load_pdf_text_and_lines(pdf_path)
+        lowered = text.lower()
+        if "new payments" in lowered and "total of payment activity" in lowered and "MRP" not in files_by_type:
+            files_by_type["MRP"] = pdf_path
+        elif "new transactions for" in lowered and "total of new transactions" in lowered and "MRC" not in files_by_type:
+            files_by_type["MRC"] = pdf_path
+        elif "statement of account" in lowered and "new balance" in lowered and "MRS" not in files_by_type:
+            files_by_type["MRS"] = pdf_path
+        elif "this completes the file for" in lowered and "CBR" not in files_by_type:
+            files_by_type["CBR"] = pdf_path
+
+    missing = [key for key in ("MRP", "MRC", "MRS", "CBR") if key not in files_by_type]
+    if missing:
+        raise ValueError(
+            f"Missing required files for ON Claims: {', '.join(missing)}. "
+            "Ensure filenames include MRP, MRC, MRS, and Credit Report."
+        )
+
+    outputs = ontario_claims.generate_claim_documents(
+        mrs_path=files_by_type["MRS"],
+        mrc_path=files_by_type["MRC"],
+        mrp_path=files_by_type["MRP"],
+        cbr_path=files_by_type["CBR"],
+        schedule_template=schedule_template,
+        claim_template=claim_template,
+        demand_letter_date=metadata.get("demand_letter_date"),
+        claim_prepared_date=metadata.get("claim_prepared_date"),
+    )
+
+    output_dir = session_dir / "output"
+    output_dir.mkdir(exist_ok=True)
+    result_paths: List[Path] = []
+    for key in ("schedule", "claim"):
+        filename, binary = outputs[key]
+        dest = output_dir / filename
+        dest.write_bytes(binary)
+        result_paths.append(dest)
+    return result_paths
+
+
 STEPS: Dict[str, StepConfig] = {
     "demand_letter": StepConfig(
         label="BC Demand Letter",
@@ -109,6 +217,58 @@ STEPS: Dict[str, StepConfig] = {
                 "accept": [".docx", ".pdf"],
                 "max": 1,
             }
+        ],
+    ),
+    "on_claims": StepConfig(
+        label="ON Claims",
+        description="Generate Ontario Schedule A and Plaintiff's Claim from four statements.",
+        file_hint="Upload the four PDFs (MRP, MRC, MRS, Credit Report) and the two Ontario templates.",
+        expected_files=6,
+        allowed_extensions=[".pdf", ".docx"],
+        processor=process_on_claims,
+        dropzones=[
+            {
+                "id": "on-mrp",
+                "label": "MRP PDF (Monthly Payment Report)",
+                "hint": "Upload the Ontario MRP statement.",
+                "accept": [".pdf"],
+                "max": 1,
+            },
+            {
+                "id": "on-mrc",
+                "label": "MRC PDF (Monthly Recap Report)",
+                "hint": "Upload the Ontario MRC statement.",
+                "accept": [".pdf"],
+                "max": 1,
+            },
+            {
+                "id": "on-mrs",
+                "label": "MRS PDF (Most Recent Statement)",
+                "hint": "Upload the Ontario MRS statement.",
+                "accept": [".pdf"],
+                "max": 1,
+            },
+            {
+                "id": "on-cbr",
+                "label": "Credit Report PDF",
+                "hint": "Upload the TransUnion credit report.",
+                "accept": [".pdf"],
+                "max": 1,
+            },
+            {
+                "id": "on-schedule",
+                "label": "Ontario Schedule A Template",
+                "hint": "Upload the ON Schedule A DOCX template.",
+                "accept": [".docx"],
+                "max": 1,
+            },
+            {
+                "id": "on-claim",
+                "label": "Ontario Form 7A Template",
+                "hint": "Upload the ON Plaintiff's Claim (Form 7A) DOCX template.",
+                "accept": [".docx"],
+                "max": 1,
+            },
         ],
     ),
     "bc_claims": StepConfig(
@@ -244,31 +404,53 @@ def index():
     step_key = request.args.get("step")
     if step_key and step_key in STEPS:
         return render_template("upload.html", step_key=step_key, step=STEPS[step_key])
-    return render_template("index.html", steps=STEPS)
+    return render_template("index.html", steps=STEPS, year=datetime.now().year)
 
 
 def _validate_files(step: StepConfig, files) -> List[Path]:
     saved_paths: List[Path] = []
-    if len(files) != step.expected_files:
-        raise ValueError(
-            f"Expected {step.expected_files} file(s) for {step.label}, "
-            f"received {len(files)}."
-        )
+    min_required = step.expected_files
+    max_allowed = step.expected_files + step.optional_max
+    if len(files) < min_required or len(files) > max_allowed:
+        if step.optional_max:
+            msg = (
+                f"Expected between {min_required} and {max_allowed} files for {step.label}, "
+                f"received {len(files)}."
+            )
+        else:
+            msg = (
+                f"Expected {min_required} file(s) for {step.label}, "
+                f"received {len(files)}."
+            )
+        raise ValueError(msg)
     session_id = uuid.uuid4().hex
     session_dir = SESSIONS_DIR / session_id
     uploads_dir = session_dir / "uploads"
     uploads_dir.mkdir(parents=True, exist_ok=True)
+    required_count = 0
+    optional_count = 0
     for storage in files:
         if not storage or not storage.filename:
             raise ValueError("Missing file upload.")
         filename = storage.filename
         suffix = Path(filename).suffix.lower()
-        if suffix not in step.allowed_extensions:
-            allowed = ", ".join(step.allowed_extensions)
-            raise ValueError(f"Invalid file type for {filename}. Allowed: {allowed}")
+        if suffix in step.allowed_extensions:
+            required_count += 1
+        elif suffix in step.optional_extensions and optional_count < step.optional_max:
+            optional_count += 1
+        else:
+            allowed = ", ".join(step.allowed_extensions + step.optional_extensions)
+            raise ValueError(
+                f"Invalid file type for {filename}. Allowed: {allowed or 'none'}"
+            )
         dest = uploads_dir / filename
         storage.save(dest)
         saved_paths.append(dest)
+    if required_count != step.expected_files:
+        raise ValueError(
+            f"Expected {step.expected_files} required file(s) for {step.label}, "
+            f"received {required_count}."
+        )
     return saved_paths
 
 
