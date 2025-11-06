@@ -207,11 +207,9 @@ STEPS: Dict[str, StepConfig] = {
     "on_claims": StepConfig(
         label="ON Claims",
         description="Generate Ontario Schedule A and Plaintiff's Claim from four statements.",
-        file_hint="Upload the four PDFs (MRP, MRC, MRS, Credit Report). Templates can be overridden if desired.",
+        file_hint="Upload the four PDFs (MRP, MRC, MRS, Credit Report).",
         expected_files=4,
         allowed_extensions=[".pdf"],
-        optional_extensions=[".docx", ".json"],
-        optional_max=3,
         processor=process_on_claims,
         dropzones=[
             {
@@ -245,30 +243,6 @@ STEPS: Dict[str, StepConfig] = {
                 "accept": [".pdf"],
                 "max": 1,
                 "required": True,
-            },
-            {
-                "id": "on-schedule",
-                "label": "Schedule A Template Override (optional)",
-                "hint": "Upload a custom Schedule A DOCX to override the default template.",
-                "accept": [".docx"],
-                "max": 1,
-                "required": False,
-            },
-            {
-                "id": "on-claim-template",
-                "label": "Form 7A Template Override (optional)",
-                "hint": "Upload a custom Plaintiff's Claim (Form 7A) DOCX if desired.",
-                "accept": [".docx"],
-                "max": 1,
-                "required": False,
-            },
-            {
-                "id": "on-metadata",
-                "label": "Case Metadata (optional)",
-                "hint": "Optional JSON with keys like demand_letter_date and claim_prepared_date.",
-                "accept": [".json"],
-                "max": 1,
-                "required": False,
             },
         ],
     ),
