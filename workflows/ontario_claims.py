@@ -12,6 +12,7 @@ from typing import Dict, Iterator, Optional, Tuple
 
 import pdfplumber
 from docx import Document
+from pypdf import PdfReader
 
 COMPANY_KEYWORDS = (
     " INC",
@@ -63,6 +64,49 @@ MODULE_DIR = Path(__file__).resolve().parent
 ASSET_DIR = MODULE_DIR.parent / "assets" / "ontario"
 DEFAULT_SCHEDULE_TEMPLATE = ASSET_DIR / "Schedule A - AMEX ON.docx"
 DEFAULT_CLAIM_TEMPLATE = ASSET_DIR / "Plaintiffs Claim Form 7A.docx"
+
+MONTH_PATTERN = re.compile(
+    r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:st|nd|rd|th)?(?:,)?\s+\d{4}",
+    re.IGNORECASE,
+)
+
+
+def parse_pdf_date_string(value: Optional[str]) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    data = str(value).strip()
+    if data.startswith("D:"):
+        data = data[2:]
+    # Remove timezone offsets like -05'00 or +01'30
+    for sep in ("+", "-", "Z"):
+        if sep in data:
+            data = data.split(sep, 1)[0]
+            break
+    if len(data) < 8:
+        return None
+    year = int(data[0:4])
+    month = int(data[4:6])
+    day = int(data[6:8])
+    hour = int(data[8:10]) if len(data) >= 10 else 0
+    minute = int(data[10:12]) if len(data) >= 12 else 0
+    second = int(data[12:14]) if len(data) >= 14 else 0
+    try:
+        return datetime(year, month, day, hour, minute, second)
+    except ValueError:
+        return None
+
+
+def parse_human_date_string(value: str) -> Optional[datetime]:
+    cleaned = value.strip()
+    cleaned = re.sub(r"(st|nd|rd|th)", "", cleaned, flags=re.IGNORECASE)
+    for fmt in ("%B %d, %Y", "%B %d %Y"):
+        try:
+            return datetime.strptime(cleaned, fmt)
+        except ValueError:
+            continue
+    return None
 
 
 class OntarioClaimsError(RuntimeError):
@@ -152,6 +196,35 @@ def load_pdf_text_and_lines(path: Path) -> Tuple[str, list[str]]:
     text = "\n".join(pages)
     lines = [line.strip() for line in text.split("\n") if line.strip()]
     return text, lines
+
+
+def parse_demand_letter_date(pdf_path: Path) -> str:
+    reader = PdfReader(str(pdf_path))
+    metadata = reader.metadata or {}
+    info = reader.trailer.get("/Info") if reader.trailer else None
+    candidates = [
+        getattr(metadata, "mod_date", None),
+        getattr(metadata, "creation_date", None),
+        metadata.get("/ModDate"),
+        metadata.get("/CreationDate"),
+    ]
+    if info:
+        info_dict = info.get_object() if hasattr(info, "get_object") else info
+        candidates.extend([info_dict.get("/ModDate"), info_dict.get("/CreationDate")])
+    for raw in candidates:
+        dt = parse_pdf_date_string(raw)
+        if dt:
+            return format_full_date(dt)
+    text, _ = load_pdf_text_and_lines(pdf_path)
+    match = MONTH_PATTERN.search(text)
+    if match:
+        dt = parse_human_date_string(match.group(0))
+        if dt:
+            return format_full_date(dt)
+    raise OntarioClaimsError(
+        f"Unable to extract the demand letter date from {pdf_path.name}. "
+        "Ensure the PDF metadata or visible text includes a readable date."
+    )
 
 
 def resolve_statement_date(token: str, start: datetime, end: datetime) -> datetime:
@@ -551,21 +624,22 @@ def generate_claim_documents(
     mrc_path: Path,
     mrp_path: Path,
     cbr_path: Path,
+    demand_letter_path: Path,
     schedule_template: Path = DEFAULT_SCHEDULE_TEMPLATE,
     claim_template: Path = DEFAULT_CLAIM_TEMPLATE,
-    demand_letter_date: Optional[str] = None,
     claim_prepared_date: Optional[str] = None,
 ) -> Dict[str, Tuple[str, bytes]]:
     if not schedule_template.exists():
         raise OntarioClaimsError(f"Schedule template not found at {schedule_template}")
     if not claim_template.exists():
         raise OntarioClaimsError(f"Claim template not found at {claim_template}")
+    if not demand_letter_path.exists():
+        raise OntarioClaimsError(f"Demand letter not found at {demand_letter_path}")
     mrs_data = parse_mrs_statement(mrs_path)
     last_charge = parse_last_purchase_date(mrc_path)
     last_payment = parse_last_payment_date(mrp_path)
     credit_data = extract_credit_report_data(cbr_path)
-    parsed_demand = parse_user_date(demand_letter_date)
-    demand_date_str = format_full_date(parsed_demand) if parsed_demand else (demand_letter_date or "")
+    demand_date_str = parse_demand_letter_date(demand_letter_path)
     prepared_dt = parse_user_date(claim_prepared_date) or datetime.today()
     name_parts = split_name_for_claim(credit_data["full_name"])
     alias = build_alias(name_parts[1], name_parts[2], name_parts[0])

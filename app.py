@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import uuid
-import json
 from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -104,35 +103,10 @@ def process_bc_claims(session_dir: Path, uploads: List[Path]) -> List[Path]:
 
 
 def process_on_claims(session_dir: Path, uploads: List[Path]) -> List[Path]:
-    metadata: Dict[str, str] = {}
-    schedule_template: Path = ontario_claims.DEFAULT_SCHEDULE_TEMPLATE
-    claim_template: Path = ontario_claims.DEFAULT_CLAIM_TEMPLATE
-    pdf_candidates: List[Path] = []
-    docx_overrides: List[Path] = []
-
-    for candidate in uploads:
-        suffix = candidate.suffix.lower()
-        if suffix == ".json":
-            raw_data = json.loads(candidate.read_text(encoding="utf-8"))
-            for key, value in raw_data.items():
-                metadata[str(key)] = str(value)
-        elif suffix == ".docx":
-            docx_overrides.append(candidate)
-        elif suffix == ".pdf":
-            pdf_candidates.append(candidate)
-
-    for docx_path in docx_overrides:
-        identified = ontario_claims.identify_template(docx_path)
-        upper_name = docx_path.name.upper()
-        if identified == "SCHEDULE" or ("SCHEDULE" in upper_name and schedule_template == ontario_claims.DEFAULT_SCHEDULE_TEMPLATE):
-            schedule_template = docx_path
-            continue
-        if identified == "CLAIM" or ("CLAIM" in upper_name or "7A" in upper_name):
-            claim_template = docx_path
-
     files_by_type: Dict[str, Path] = {}
     leftovers: List[Path] = []
-    for pdf_path in pdf_candidates:
+
+    for pdf_path in uploads:
         name = pdf_path.name.upper()
         if "MRP" in name and "MRP" not in files_by_type:
             files_by_type["MRP"] = pdf_path
@@ -142,6 +116,8 @@ def process_on_claims(session_dir: Path, uploads: List[Path]) -> List[Path]:
             files_by_type["MRS"] = pdf_path
         elif ("CBR" in name or "CREDIT REPORT" in name) and "CBR" not in files_by_type:
             files_by_type["CBR"] = pdf_path
+        elif "DEMAND" in name and "DEMAND" not in files_by_type:
+            files_by_type["DEMAND"] = pdf_path
         else:
             leftovers.append(pdf_path)
 
@@ -156,12 +132,14 @@ def process_on_claims(session_dir: Path, uploads: List[Path]) -> List[Path]:
             files_by_type["MRS"] = pdf_path
         elif "this completes the file for" in lowered and "CBR" not in files_by_type:
             files_by_type["CBR"] = pdf_path
+        elif "demand letter" in lowered and "DEMAND" not in files_by_type:
+            files_by_type["DEMAND"] = pdf_path
 
-    missing = [key for key in ("MRP", "MRC", "MRS", "CBR") if key not in files_by_type]
+    missing = [key for key in ("MRP", "MRC", "MRS", "CBR", "DEMAND") if key not in files_by_type]
     if missing:
         raise ValueError(
             f"Missing required files for ON Claims: {', '.join(missing)}. "
-            "Ensure filenames include MRP, MRC, MRS, and Credit Report."
+            "Ensure filenames include MRP, MRC, MRS, Credit Report, and Demand Letter."
         )
 
     outputs = ontario_claims.generate_claim_documents(
@@ -169,10 +147,7 @@ def process_on_claims(session_dir: Path, uploads: List[Path]) -> List[Path]:
         mrc_path=files_by_type["MRC"],
         mrp_path=files_by_type["MRP"],
         cbr_path=files_by_type["CBR"],
-        schedule_template=schedule_template,
-        claim_template=claim_template,
-        demand_letter_date=metadata.get("demand_letter_date"),
-        claim_prepared_date=metadata.get("claim_prepared_date"),
+        demand_letter_path=files_by_type["DEMAND"],
     )
 
     output_dir = session_dir / "output"
@@ -206,9 +181,9 @@ STEPS: Dict[str, StepConfig] = {
     ),
     "on_claims": StepConfig(
         label="ON Claims",
-        description="Generate Ontario Schedule A and Plaintiff's Claim from four statements.",
-        file_hint="Upload the four PDFs (MRP, MRC, MRS, Credit Report).",
-        expected_files=4,
+        description="Generate Ontario Schedule A and Plaintiff's Claim from statements and the demand letter.",
+        file_hint="Upload the four PDFs (MRP, MRC, MRS, Credit Report) plus the demand letter PDF.",
+        expected_files=5,
         allowed_extensions=[".pdf"],
         processor=process_on_claims,
         dropzones=[
@@ -240,6 +215,14 @@ STEPS: Dict[str, StepConfig] = {
                 "id": "on-cbr",
                 "label": "Credit Report PDF",
                 "hint": "Upload the TransUnion credit report.",
+                "accept": [".pdf"],
+                "max": 1,
+                "required": True,
+            },
+            {
+                "id": "on-demand",
+                "label": "Demand Letter PDF",
+                "hint": "Upload the signed demand letter PDF.",
                 "accept": [".pdf"],
                 "max": 1,
                 "required": True,
