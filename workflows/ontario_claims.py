@@ -662,6 +662,13 @@ def generate_claim_documents(
     schedule_bytes = document_to_bytes(schedule_doc)
     claim_doc = Document(claim_template)
     replace_placeholders(claim_doc, claim_mapping)
+    replace_placeholders(
+        claim_doc,
+        {
+            "☐ADDITIONAL PAGES ARE ATTACHED BECAUSE MORE ROOM WAS NEEDED.":
+            "☑︎ADDITIONAL PAGES ARE ATTACHED BECAUSE MORE ROOM WAS NEEDED."
+        },
+    )
     claim_bytes = document_to_bytes(claim_doc)
     schedule_filename = (
         f"filled_template_Schedule A - 1 Credit Card_{sanitize_for_filename(mrs_data['full_name'])}.docx"
