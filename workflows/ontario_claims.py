@@ -12,6 +12,7 @@ from typing import Dict, Iterator, Optional, Tuple
 
 import pdfplumber
 from docx import Document
+from docx.shared import RGBColor, Pt
 from pypdf import PdfReader
 
 COMPANY_KEYWORDS = (
@@ -138,6 +139,43 @@ def canonicalize_postal_code(code: str) -> str:
     if len(cleaned) == 6:
         return f"{cleaned[:3]} {cleaned[3:]}"
     return cleaned
+
+
+CITY_LINE_PATTERN = re.compile(
+    r"(?P<city>[A-Z0-9 .,'/-]+?)\s+(?P<province>[A-Z]{2})\s+(?P<postal>[A-Z]\d[A-Z]\s?\d[A-Z]\d)(?:\s|$)"
+)
+
+
+def split_city_province_postal(line: str) -> Tuple[str, str, str]:
+    """Extract city/province/postal segments from the final MRS address line."""
+
+    if not line:
+        return "", "", ""
+    normalized = normalize_whitespace(line.replace(",", " "))
+    upper_line = normalized.upper()
+    match = CITY_LINE_PATTERN.search(upper_line)
+    if match:
+        city = normalize_whitespace(match.group("city"))
+        province = match.group("province")
+        postal = canonicalize_postal_code(match.group("postal"))
+        return city, province, postal
+
+    tokens = upper_line.split()
+    province = ""
+    postal = ""
+    city_tokens = tokens
+    for idx in range(len(tokens) - 1):
+        combined = "".join(tokens[idx : idx + 2])
+        if re.fullmatch(r"[A-Z]\d[A-Z]\d[A-Z]\d", combined):
+            postal = canonicalize_postal_code(combined)
+            if idx > 0 and re.fullmatch(r"[A-Z]{2}", tokens[idx - 1]):
+                province = tokens[idx - 1]
+                city_tokens = tokens[: idx - 1]
+            else:
+                city_tokens = tokens[:idx]
+            break
+    city = " ".join(city_tokens).strip()
+    return city, province, postal
 
 
 def parse_compact_date(token: str) -> datetime:
@@ -273,6 +311,55 @@ def build_alias(first: str, middle: str, last: str) -> str:
     return alias.upper()
 
 
+def normalize_alias_name(raw: str, primary_last: str) -> str:
+    cleaned = normalize_whitespace(raw.replace("/", " "))
+    if not cleaned:
+        return ""
+    tokens = cleaned.split()
+    if any(re.search(r"\d", token) for token in tokens):
+        return ""
+    if len(tokens) >= 2 and tokens[0].upper() == primary_last.upper():
+        tokens = tokens[1:] + tokens[:1]
+    return " ".join(tokens).upper()
+
+
+def build_alias_string(
+    primary_alias: str,
+    extra_aliases: list[str],
+    last_name: str,
+    first_name: str,
+) -> str:
+    values: list[str] = []
+    seen: set[str] = set()
+    base_first_last = ""
+    if first_name and last_name:
+        base_first_last = re.sub(
+            r"[^A-Z0-9]",
+            "",
+            normalize_whitespace(f"{first_name} {last_name}").upper(),
+        )
+
+    def add(value: str) -> None:
+        cleaned = normalize_whitespace(value)
+        if not cleaned:
+            return
+        comparable = re.sub(r"[^A-Z0-9]", "", cleaned.upper())
+        if not comparable or comparable == base_first_last or comparable in seen:
+            return
+        values.append(cleaned)
+        seen.add(comparable)
+
+    add(primary_alias)
+    for candidate in extra_aliases:
+        normalized = normalize_alias_name(candidate, last_name)
+        if normalized:
+            add(normalized)
+    if first_name and last_name:
+        last_first = normalize_whitespace(f"{last_name} {first_name}").upper()
+        add(last_first)
+    return " a.k.a. ".join(values) if values else ""
+
+
 def sanitize_for_filename(text: str, space_replacement: str = " ") -> str:
     cleaned = re.sub(r"[^A-Za-z0-9 _-]", "", text).strip()
     cleaned = re.sub(r"\s+", " ", cleaned)
@@ -334,21 +421,37 @@ def parse_mrs_statement(path: Path) -> Dict[str, object]:
     except ValueError as exc:
         raise OntarioClaimsError("Unable to locate mailing block name in MRS.") from exc
     address_lines = []
-    for line in lines[name_index + 1:]:
-        if not re.fullmatch(r"[A-Z0-9 ,#'&.-]+", line):
+    skip_keywords = (
+        "STATEMENT OF ACCOUNT",
+        "ACCOUNT SUMMARY",
+        "PAGE ",
+        "CUSTOMER SERVICE",
+        "AMERICANEXPRESS",
+        "AMERICAN EXPRESS",
+    )
+    for line in lines[name_index + 1 :]:
+        cleaned = line.strip()
+        if not cleaned:
+            if address_lines:
+                break
+            continue
+        upper_line = cleaned.upper()
+        if any(keyword in upper_line for keyword in skip_keywords):
             break
-        address_lines.append(line)
+        address_lines.append(upper_line)
+        if len(address_lines) >= 2 and re.search(r"[A-Z]\d[A-Z]\s?\d[A-Z]\d", upper_line.replace(" ", "")):
+            break
+
+    if not address_lines:
+        raise OntarioClaimsError("Unable to parse mailing address from MRS.")
+
     street_parts = address_lines[:-1] if len(address_lines) > 1 else address_lines
-    city_line = address_lines[-1] if address_lines else ""
-    city_tokens = city_line.split()
-    city_raw = normalize_whitespace(" ".join(city_tokens[:-2])) if len(city_tokens) >= 3 else ""
-    province = city_tokens[-2] if len(city_tokens) >= 2 else ""
-    postal = canonicalize_postal_code(city_tokens[-1]) if city_tokens else ""
-    schedule_address_parts = list(street_parts)
-    if city_raw:
-        schedule_address_parts.append(f"{city_raw} {province} {postal}".strip())
-    schedule_address = ", ".join(part for part in schedule_address_parts if part)
+    city_line = address_lines[-1] if len(address_lines) > 1 else ""
+    city_raw, province, postal = split_city_province_postal(city_line)
+    city_clean = normalize_whitespace(city_raw)
     street_unit = ", ".join(street_parts).strip(", ")
+    city_block = " ".join(part for part in (city_clean, province, postal) if part).strip()
+    full_address = ", ".join(part for part in (street_unit, city_block) if part).strip(", ")
     summary_patterns = {
         "previous_balance": r"Previous Balance \$([0-9,]+\.\d{2})",
         "less_payments": r"Less Payments \$([0-9,]+\.\d{2})",
@@ -363,6 +466,8 @@ def parse_mrs_statement(path: Path) -> Dict[str, object]:
             raise OntarioClaimsError(f"Missing '{key}' in the account summary.")
         summary[key] = Decimal(match.group(1).replace(",", ""))
     province_full = PROVINCE_NAMES.get(province.upper(), province.upper())
+    city_title = to_title_case(city_clean) if city_clean else ""
+    schedule_address = ", ".join(part for part in (city_title, province_full) if part).strip(", ")
     interest_rate = ""
     for idx, line in enumerate(lines):
         if line.strip().lower() == "purchases":
@@ -388,9 +493,11 @@ def parse_mrs_statement(path: Path) -> Dict[str, object]:
         "end_date": end_date,
         "date_range": f"{format_short_month(start_date)} – {format_short_month(end_date)}",
         "schedule_address": schedule_address,
+        "full_address": full_address,
         "street_unit": street_unit,
-        "city": city_raw.upper() if city_raw else "",
-        "city_title": to_title_case(city_raw),
+        "street_unit_upper": street_unit.upper(),
+        "city": city_clean.upper() if city_clean else "",
+        "city_title": city_title,
         "province": province.upper(),
         "province_full": province_full,
         "postal": postal,
@@ -516,7 +623,12 @@ def extract_credit_report_data(path: Path) -> Dict[str, str]:
     current_phone = format_phone(data_tokens[2])
     prev_phone = format_phone(data_tokens[3]) if len(data_tokens) > 3 else ""
     phone = current_phone or prev_phone
-    return {"full_name": full_name, "phone": phone, "birth": birth_token}
+    aka_lines = [
+        line.split("AKA ", 1)[1].strip()
+        for line in lines
+        if line.startswith("AKA ")
+    ]
+    return {"full_name": full_name, "phone": phone, "birth": birth_token, "akas": aka_lines}
 
 
 def apply_mapping(text: str, mapping: Dict[str, str]) -> str:
@@ -537,40 +649,126 @@ def iter_paragraphs(element) -> Iterator:
                     yield from iter_paragraphs(cell)
 
 
-def replace_placeholders(doc: Document, mapping: Dict[str, str]) -> None:
-    def replace_in_paragraph(paragraph):
-        if not paragraph.runs:
-            return
-        original = "".join(run.text for run in paragraph.runs)
-        updated = apply_mapping(original, mapping)
-        if updated != original:
-            paragraph.runs[0].text = updated
-            for run in paragraph.runs[1:]:
-                run.text = ""
-
+def document_contains_placeholder(doc: Document, placeholder: str) -> bool:
     for paragraph in iter_paragraphs(doc):
-        replace_in_paragraph(paragraph)
+        if placeholder in paragraph.text:
+            return True
+    for section in doc.sections:
+        for header in (section.header, section.footer):
+            for paragraph in iter_paragraphs(header):
+                if placeholder in paragraph.text:
+                    return True
+    return False
+
+
+def replace_placeholders(doc: Document, mapping: Dict[str, str]) -> None:
+    """Replace placeholders while preserving original run styling."""
+
+    def replace_once(paragraph, placeholder: str, replacement: str) -> bool:
+        runs = paragraph.runs
+        if not runs:
+            return False
+        text = "".join(run.text for run in runs)
+        idx = text.find(placeholder)
+        if idx == -1:
+            return False
+        char_map = []
+        for run_idx, run in enumerate(runs):
+            char_map.extend([(run_idx, char_idx) for char_idx in range(len(run.text))])
+        start = idx
+        end = idx + len(placeholder) - 1
+        if end >= len(char_map):
+            return False
+        start_run_idx, start_char_idx = char_map[start]
+        end_run_idx, end_char_idx = char_map[end]
+        start_run = runs[start_run_idx]
+        end_run = runs[end_run_idx]
+        prefix = start_run.text[:start_char_idx]
+        suffix = end_run.text[end_char_idx + 1 :]
+        if start_run_idx == end_run_idx:
+            start_run.text = f"{prefix}{replacement}{suffix}"
+        else:
+            start_run.text = f"{prefix}{replacement}"
+            for run_idx in range(start_run_idx + 1, end_run_idx):
+                runs[run_idx].text = ""
+            end_run.text = suffix
+        return True
+
+    items = list(mapping.items())
+    for paragraph in iter_paragraphs(doc):
+        for placeholder, value in items:
+            while replace_once(paragraph, placeholder, value):
+                pass
 
     for section in doc.sections:
         for header in (section.header, section.footer):
             for paragraph in iter_paragraphs(header):
-                replace_in_paragraph(paragraph)
+                for placeholder, value in items:
+                    while replace_once(paragraph, placeholder, value):
+                        pass
+
+
+def fill_second_name_cell(doc: Document, middle_name: str) -> None:
+    text = normalize_whitespace(middle_name or "")
+    if not text:
+        return
+    target_value = text.upper()
+    in_defendant_section = False
+    for table in doc.tables:
+        for row in table.rows:
+            row_text = " ".join(cell.text for cell in row.cells)
+            if "Defendant No. 1" in row_text:
+                in_defendant_section = True
+            if not in_defendant_section:
+                continue
+            for cell in row.cells:
+                if "SECOND NAME INSERT" in cell.text or cell.text.strip() == "Second name":
+                    for para in cell.paragraphs:
+                        for run in para.runs:
+                            run.text = run.text.replace("SECOND NAME INSERT", "")
+                    para = cell.add_paragraph() if len(cell.paragraphs) == 1 else cell.paragraphs[-1]
+                    run = para.add_run(target_value)
+                    run.font.name = "Arial"
+                    run.font.size = Pt(10)
+                    run.font.color.rgb = RGBColor(0, 32, 96)
+                    run.font.bold = True
+                    return
+
+
+def mark_additional_pages_checkbox(doc: Document) -> None:
+    target = "ADDITIONAL PAGES ARE ATTACHED BECAUSE MORE ROOM WAS NEEDED."
+    replacement = f"\u2611 {target}"
+    for paragraph in iter_paragraphs(doc):
+        if target not in paragraph.text or "\u2611" in paragraph.text:
+            continue
+        for run in paragraph.runs:
+            if target in run.text and "\u2611" not in run.text:
+                run.text = run.text.replace(target, replacement)
+        if not paragraph.runs:
+            paragraph.text = paragraph.text.replace(target, replacement)
 
 
 def build_schedule_mapping(
     mrs_data: Dict[str, object],
     last_charge: datetime,
     last_payment: datetime,
-    alias: str,
+    alias_string: str,
     demand_letter_date: str,
 ) -> Dict[str, str]:
     summary: Dict[str, Decimal] = mrs_data["summary"]  # type: ignore[assignment]
     simple_name = mrs_data["full_name"]
-    if alias:
-        simple_name = f"{simple_name} a.k.a. {alias}"
+    if alias_string:
+        simple_name = f"{simple_name} a.k.a. {alias_string}"
+    schedule_address = (
+        mrs_data.get("schedule_address")
+        or ", ".join(
+            part for part in (mrs_data.get("city_title", ""), mrs_data.get("province_full", "")) if part
+        ).strip(", ")
+    )
+    court_city = mrs_data.get("city_title") or mrs_data.get("province_full") or "Ottawa"
     return {
         "SIMPLE NAME INSERT": simple_name,
-        "ADRESS INSERT": f"{mrs_data['city_title']}, {mrs_data['province_full']}",
+        "ADRESS INSERT": schedule_address,
         "CARDNUMBERINSERT": mrs_data["card_suffix"],
         "CARD TYPE INSERT": mrs_data["card_type"],
         "DATE OF LAST CHARGE INSERT": format_full_date(last_charge),
@@ -583,7 +781,7 @@ def build_schedule_mapping(
         "PAYMENTS INSERT": format_currency(summary["less_payments"]),
         "TOTALDEBTINSERT": format_currency(summary["new_balance"]),
         "DEMAND LETTER DATE INSERT": demand_letter_date,
-        "Ottawa Small Claims Court": f"{mrs_data['city_title']} Small Claims Court",
+        "Ottawa Small Claims Court": f"{court_city} Small Claims Court",
     }
 
 
@@ -591,17 +789,20 @@ def build_claim_mapping(
     mrs_data: Dict[str, object],
     phone: str,
     prepared_date: datetime,
-    name_parts: Tuple[str, str, str],
-    alias: str,
+    claim_name_parts: Tuple[str, str, str],
+    alias_string: str,
 ) -> Dict[str, str]:
     summary: Dict[str, Decimal] = mrs_data["summary"]  # type: ignore[assignment]
-    last_name, first_name, middle_names = name_parts
-    aka_value = alias
-    return {
+    last_name, first_name, middle_names = claim_name_parts
+    address_value = mrs_data.get("street_unit_upper") or mrs_data["street_unit"]
+    middle_value = normalize_whitespace(middle_names or "").upper()
+    mapping = {
         "LAST NAME INSERT": last_name,
         "FIRST NAME INSERT": first_name,
-        "AKA INSERT": aka_value,
-        "ADRESS INSERT": mrs_data["street_unit"],
+        "AKA INSERT": alias_string,
+        "ADRESS INSERT": address_value,
+        "ADDRESS INSERT": address_value,
+        "DRESS INSERT": address_value,
         "CITY INSERT": mrs_data["city"],
         "PROVINSERT": mrs_data["province"],
         "POSTALCODEINSERT": mrs_data["postal"],
@@ -609,7 +810,9 @@ def build_claim_mapping(
         "DEBTINSERT": format_currency(summary["new_balance"]),
         "TODAYS DATE": format_claim_date(prepared_date),
         "YEARENDINSERT": prepared_date.strftime("%y"),
+        "SECOND NAME INSERT": middle_value,
     }
+    return mapping
 
 
 def document_to_bytes(document: Document) -> bytes:
@@ -641,39 +844,43 @@ def generate_claim_documents(
     credit_data = extract_credit_report_data(cbr_path)
     demand_date_str = parse_demand_letter_date(demand_letter_path)
     prepared_dt = parse_user_date(claim_prepared_date) or datetime.today()
-    name_parts = split_name_for_claim(credit_data["full_name"])
-    alias = build_alias(name_parts[1], name_parts[2], name_parts[0])
+    credit_name_parts = split_name_for_claim(credit_data["full_name"])
+    claim_name_parts = split_name_for_claim(mrs_data["full_name"])
+    primary_alias = build_alias(credit_name_parts[1], credit_name_parts[2], credit_name_parts[0])
+    alias_string = build_alias_string(
+        primary_alias,
+        credit_data.get("akas", []),
+        credit_name_parts[0],
+        credit_name_parts[1],
+    )
     schedule_mapping = build_schedule_mapping(
         mrs_data,
         last_charge,
         last_payment,
-        alias,
+        alias_string,
         demand_date_str,
     )
     claim_mapping = build_claim_mapping(
         mrs_data,
         credit_data["phone"],
         prepared_dt,
-        name_parts,
-        alias,
+        claim_name_parts,
+        alias_string,
     )
     schedule_doc = Document(schedule_template)
     replace_placeholders(schedule_doc, schedule_mapping)
     schedule_bytes = document_to_bytes(schedule_doc)
     claim_doc = Document(claim_template)
+    has_second_name_placeholder = document_contains_placeholder(claim_doc, "SECOND NAME INSERT")
     replace_placeholders(claim_doc, claim_mapping)
-    replace_placeholders(
-        claim_doc,
-        {
-            "☐ADDITIONAL PAGES ARE ATTACHED BECAUSE MORE ROOM WAS NEEDED.":
-            "☑︎ADDITIONAL PAGES ARE ATTACHED BECAUSE MORE ROOM WAS NEEDED."
-        },
-    )
+    if not has_second_name_placeholder:
+        fill_second_name_cell(claim_doc, claim_name_parts[2])
+    mark_additional_pages_checkbox(claim_doc)
     claim_bytes = document_to_bytes(claim_doc)
     schedule_filename = (
         f"filled_template_Schedule A - 1 Credit Card_{sanitize_for_filename(mrs_data['full_name'])}.docx"
     )
-    last_name, first_name, _ = name_parts
+    last_name, first_name, _ = claim_name_parts
     claim_suffix_parts = [sanitize_for_filename(last_name, "_")]
     if first_name:
         claim_suffix_parts.append(sanitize_for_filename(first_name, "_"))
